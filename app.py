@@ -153,6 +153,11 @@ def whatsapp_webhook():
     data = request.get_json(silent=True)
     app.logger.info(f"Received webhook payload: {data}")
     
+    # TEMPORARY FIX: Return 200 OK immediately to stop Meta's retry loop
+    # This breaks the queue of old retrying messages
+    # Comment this out once Google quota is reset
+    return "OK", 200
+    
     if not data:
         return "No data", 400
 
