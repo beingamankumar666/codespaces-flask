@@ -3,7 +3,7 @@ import logging
 import time
 from flask import Flask, request, jsonify, render_template
 import requests
-from google import genai
+import google.generativeai as genai
 
 # Load environment variables from .env file
 from dotenv import load_dotenv
