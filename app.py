@@ -34,19 +34,20 @@ try:
         raise ValueError("WHATSAPP_VERIFY_TOKEN environment variable is required")
     
     # Provider priority order: list of available providers
+    # Order: Best free tier → Fallback options
     AVAILABLE_PROVIDERS = []
-    if OPENROUTER_API_KEY:
-        AVAILABLE_PROVIDERS.append("openrouter")
     if GROQ_API_KEY:
-        AVAILABLE_PROVIDERS.append("groq")
+        AVAILABLE_PROVIDERS.append("groq")  # PRIMARY: Fast, generous free tier
+    if OPENROUTER_API_KEY:
+        AVAILABLE_PROVIDERS.append("openrouter")  # FALLBACK: Multiple free models
     if GEMINI_API_KEY:
-        AVAILABLE_PROVIDERS.append("gemini")
+        AVAILABLE_PROVIDERS.append("gemini")  # BACKUP: Once quota resets
     
     if not AVAILABLE_PROVIDERS:
         raise ValueError("At least one AI provider key required: OPENROUTER_API_KEY, GROQ_API_KEY, or GEMINI_API_KEY")
     
     print("✅ All credentials validated successfully!")
-    print(f"📍 Available AI Providers (in fallback order): {AVAILABLE_PROVIDERS}")
+    print(f"📍 Provider Priority: Groq → OpenRouter → Gemini")
 except ValueError as e:
     print(f"❌ Configuration error: {e}")
     exit(1)
