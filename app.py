@@ -4,6 +4,7 @@ import time
 from flask import Flask, request, jsonify, render_template
 import requests
 import google.generativeai as genai
+from datetime import datetime, timedelta
 
 # Load environment variables from .env file
 from dotenv import load_dotenv
@@ -15,11 +16,10 @@ app = Flask(__name__)
 # CONFIGURATION - Validate credentials at startup
 # ============================================================================
 
-# Validate all required environment variables at startup
 try:
-    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-    if not GEMINI_API_KEY:
-        raise ValueError("GEMINI_API_KEY environment variable is required")
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+    GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+    OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
     
     WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
     if not WHATSAPP_TOKEN:
@@ -33,10 +33,22 @@ try:
     if not WHATSAPP_VERIFY_TOKEN:
         raise ValueError("WHATSAPP_VERIFY_TOKEN environment variable is required")
     
+    # Provider priority order: list of available providers
+    AVAILABLE_PROVIDERS = []
+    if OPENROUTER_API_KEY:
+        AVAILABLE_PROVIDERS.append("openrouter")
+    if GROQ_API_KEY:
+        AVAILABLE_PROVIDERS.append("groq")
+    if GEMINI_API_KEY:
+        AVAILABLE_PROVIDERS.append("gemini")
+    
+    if not AVAILABLE_PROVIDERS:
+        raise ValueError("At least one AI provider key required: OPENROUTER_API_KEY, GROQ_API_KEY, or GEMINI_API_KEY")
+    
     print("✅ All credentials validated successfully!")
+    print(f"📍 Available AI Providers (in fallback order): {AVAILABLE_PROVIDERS}")
 except ValueError as e:
     print(f"❌ Configuration error: {e}")
-    print("Please set the required environment variables in your .env file")
     exit(1)
 
 # ============================================================================
@@ -46,6 +58,14 @@ except ValueError as e:
 def get_gemini_api_key():
     """Get validated Gemini API key."""
     return GEMINI_API_KEY
+
+def get_groq_api_key():
+    """Get validated Groq API key."""
+    return GROQ_API_KEY
+
+def get_openrouter_api_key():
+    """Get validated OpenRouter API key."""
+    return OPENROUTER_API_KEY
 
 def get_whatsapp_token():
     """Get validated WhatsApp token."""
@@ -59,16 +79,214 @@ def get_verify_token():
     """Get validated verification token."""
     return WHATSAPP_VERIFY_TOKEN
 
+# ============================================================================
+# RATE LIMITING & QUOTA MANAGEMENT
+# ============================================================================
+
+class ProviderQuota:
+    """Track quota usage for each provider"""
+    def __init__(self):
+        self.provider_status = {
+            "openrouter": {"disabled": False, "reset_time": None},
+            "groq": {"disabled": False, "reset_time": None},
+            "gemini": {"disabled": False, "reset_time": None}
+        }
+    
+    def mark_provider_failed(self, provider, duration_hours=24):
+        """Mark provider as failed temporarily"""
+        self.provider_status[provider]["disabled"] = True
+        self.provider_status[provider]["reset_time"] = datetime.now() + timedelta(hours=duration_hours)
+        app.logger.warning(f"🔴 {provider.upper()} disabled for {duration_hours}h")
+    
+    def is_provider_available(self, provider):
+        """Check if provider is available"""
+        status = self.provider_status.get(provider, {})
+        if not status.get("disabled"):
+            return True
+        
+        reset_time = status.get("reset_time")
+        if reset_time and datetime.now() > reset_time:
+            status["disabled"] = False
+            app.logger.info(f"🟢 {provider.upper()} quota reset!")
+            return True
+        return False
+    
+    def get_available_providers(self):
+        """Get list of available providers in order"""
+        available = []
+        for provider in AVAILABLE_PROVIDERS:
+            if self.is_provider_available(provider):
+                available.append(provider)
+        return available
+
+quota_manager = ProviderQuota()
+
+# ============================================================================
+# AI PROVIDER IMPLEMENTATIONS
+# ============================================================================
+
 # Lazy-loaded Gemini client
 _gemini_client = None
+GEMINI_MODEL = 'gemini-2.0-flash'
 
 def get_gemini_client():
     """Get or create Gemini model with lazy initialization."""
     global _gemini_client
-    if _gemini_client is None:
-        genai.configure(api_key=get_gemini_api_key())
+    if _gemini_client is None and GEMINI_API_KEY:
+        genai.configure(api_key=GEMINI_API_KEY)
         _gemini_client = genai.GenerativeModel(GEMINI_MODEL)
     return _gemini_client
+
+def call_openrouter(prompt):
+    """Call OpenRouter API with multiple free model fallbacks"""
+    try:
+        if not OPENROUTER_API_KEY:
+            return None, "OpenRouter API key not configured"
+        
+        if not quota_manager.is_provider_available("openrouter"):
+            return None, "OpenRouter quota exceeded"
+        
+        # Free tier models on OpenRouter (try in order)
+        models = [
+            "mistralai/mistral-7b-instruct:free",
+            "meta-llama/llama-2-70b-chat:free",
+            "gryphe/mythomist-7b:free"
+        ]
+        
+        url = "https://openrouter.io/api/v1/chat/completions"
+        
+        for model in models:
+            try:
+                headers = {
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json"
+                }
+                payload = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.7,
+                    "max_tokens": 500
+                }
+                
+                response = requests.post(url, headers=headers, json=payload, timeout=30)
+                
+                if response.status_code == 429:
+                    app.logger.warning(f"OpenRouter rate limited for {model}")
+                    continue
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get("choices") and len(data["choices"]) > 0:
+                        result = data["choices"][0]["message"]["content"].strip()
+                        app.logger.info(f"✅ OpenRouter ({model}): Success")
+                        return result, None
+            except Exception as e:
+                app.logger.warning(f"OpenRouter model {model} failed: {e}")
+                continue
+        
+        return None, "All OpenRouter models failed"
+        
+    except Exception as e:
+        app.logger.error(f"OpenRouter error: {e}")
+        quota_manager.mark_provider_failed("openrouter", duration_hours=1)
+        return None, str(e)
+
+def call_gemini(prompt):
+    """Call Gemini API with error handling"""
+    try:
+        if not GEMINI_API_KEY:
+            return None, "Gemini API key not configured"
+        
+        if not quota_manager.is_provider_available("gemini"):
+            return None, "Gemini quota exceeded"
+        
+        model = get_gemini_client()
+        response = model.generate_content(prompt, timeout=30)
+        
+        if response and response.text:
+            return response.text.strip(), None
+        return None, "Empty response from Gemini"
+        
+    except Exception as e:
+        error_msg = str(e)
+        if "429" in error_msg or "quota" in error_msg.lower():
+            quota_manager.mark_provider_failed("gemini", duration_hours=24)
+        app.logger.error(f"Gemini error: {error_msg}")
+        return None, error_msg
+
+def call_groq(prompt):
+    """Call Groq API with error handling"""
+    try:
+        if not GROQ_API_KEY:
+            return None, "Groq API key not configured"
+        
+        if not quota_manager.is_provider_available("groq"):
+            return None, "Groq rate limited"
+        
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": "mixtral-8x7b-32768",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.7,
+            "max_tokens": 500
+        }
+        
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        
+        if response.status_code == 429:
+            quota_manager.mark_provider_failed("groq", duration_hours=1)
+            return None, "Groq rate limited"
+        
+        if response.status_code != 200:
+            return None, f"Groq API error: {response.status_code}"
+        
+        data = response.json()
+        if data.get("choices") and len(data["choices"]) > 0:
+            return data["choices"][0]["message"]["content"].strip(), None
+        return None, "Empty response from Groq"
+        
+    except Exception as e:
+        app.logger.error(f"Groq error: {e}")
+        return None, str(e)
+
+def get_ai_response(prompt):
+    """Get AI response with intelligent provider fallback"""
+    available_providers = quota_manager.get_available_providers()
+    
+    if not available_providers:
+        app.logger.error("❌ No AI providers available!")
+        return "Badiya bhai, par sab servers thak gaye hain. 5 min baad try karna!"
+    
+    app.logger.info(f"🔄 Trying providers: {available_providers}")
+    
+    # Try each available provider in order
+    for provider in available_providers:
+        response = None
+        error = None
+        
+        try:
+            if provider == "openrouter":
+                response, error = call_openrouter(prompt)
+            elif provider == "groq":
+                response, error = call_groq(prompt)
+            elif provider == "gemini":
+                response, error = call_gemini(prompt)
+            
+            if response:
+                app.logger.info(f"✅ Got response from {provider}")
+                return response
+            
+            app.logger.warning(f"⚠️ {provider} failed: {error}")
+        except Exception as e:
+            app.logger.error(f"Error with {provider}: {e}")
+    
+    # If all providers fail
+    app.logger.error(f"❌ All providers failed: {available_providers}")
+    return "Badiya bhai, par abhi server mein issue hai. Thodi der baad try karna!"
 
 # ============================================================================
 # AMAN KUMAR PERSONA - Detailed System Prompt
@@ -86,7 +304,7 @@ AMAN_KUMAR_SYSTEM_PROMPT = """Tum Aman Kumar ke AI avatar ho. Tumhara profile ye
 
 **Knowledge Base**:
 - Current Focus: Cloud-based AI WhatsApp Integration
-- Tools: GitHub Codespaces, Meta WhatsApp Business API, Gemini AI
+- Tools: GitHub Codespaces, Meta WhatsApp Business API, Groq & Gemini AI
 - Philosophy: "Pehle setup aur raw material ko prioritize karna, phir execution."
 
 **Instructions**:
@@ -100,10 +318,6 @@ Tumse baat karne wale koaise greet karna hai:
 - "Namaste bhai/bahin! Aman Kumar bol raha hoon. Kya help chahiye?"
 
 Ab niche user ka message hai. Aman Kumar jaise reply karo:"""
-
-# Create Gemini model instance (we'll use it when calling API)
-# The model name for the new API
-GEMINI_MODEL = 'gemini-2.0-flash'
 
 # ============================================================================
 # FLASK ROUTES
@@ -153,46 +367,70 @@ def whatsapp_webhook():
     data = request.get_json(silent=True)
     app.logger.info(f"Received webhook payload: {data}")
     
-    # TEMPORARY FIX: Return 200 OK immediately to stop Meta's retry loop
-    # This breaks the queue of old retrying messages
-    # Comment this out once Google quota is reset
-    return "OK", 200
-    
-    if not data:
-        return "No data", 400
-
-    # Extract phone number and message text
-    phone = None
-    text = None
-    
-    try:
-        entry = data.get("entry", [{}])[0]
-        changes = entry.get("changes", [{}])[0]
-        value = changes.get("value", {})
-        messages = value.get("messages", [])
-        
-        if not messages:
-            return "No message", 200
+    # ALWAYS return 200 OK immediately to Meta to prevent retry loop
+    # Process message asynchronously
+    if data:
+        try:
+            entry = data.get("entry", [{}])[0]
+            changes = entry.get("changes", [{}])[0]
+            value = changes.get("value", {})
+            messages = value.get("messages", [])
             
-        message = messages[0]
-        phone = message.get("from")
-        
-        # Text messages are under text.body
-        text = message.get("text", {}).get("body")
-        
-        # Fallback: button replies
-        if not text:
-            text = message.get("button", {}).get("text")
-            
-        # Fallback: interactive messages
-        if not text:
-            interactive = message.get("interactive", {})
-            if interactive.get("type") == "button_reply":
-                text = interactive.get("button_reply", {}).get("title")
+            if messages:
+                message = messages[0]
+                phone = message.get("from")
+                text = message.get("text", {}).get("body") or message.get("button", {}).get("text")
                 
+                if not text:
+                    interactive = message.get("interactive", {})
+                    if interactive.get("type") == "button_reply":
+                        text = interactive.get("button_reply", {}).get("title")
+                
+                if phone and text:
+                    # Process message in background (return 200 immediately)
+                    process_whatsapp_message(phone, text)
+                    app.logger.info(f"Message queued: {phone} → {text}")
+        except Exception as e:
+            app.logger.error(f"Error parsing webhook: {e}")
+    
+    # Return 200 OK immediately - this stops Meta's retry queue
+    return "OK", 200
+
+def process_whatsapp_message(phone, text):
+    """Process WhatsApp message and send response"""
+    try:
+        full_prompt = f"{AMAN_KUMAR_SYSTEM_PROMPT}\n\nUser ka message: {text}"
+        ai_response = get_ai_response(full_prompt)
+        
+        app.logger.info(f"AI response: {ai_response}")
+        
+        # Send response back via WhatsApp
+        try:
+            url = f"https://graph.facebook.com/v18.0/{get_phone_number_id()}/messages"
+            headers = {
+                "Authorization": f"Bearer {get_whatsapp_token()}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "messaging_product": "whatsapp",
+                "to": phone,
+                "type": "text",
+                "text": {"body": ai_response},
+            }
+            
+            app.logger.info(f"Sending message to {phone}")
+            r = requests.post(url, headers=headers, json=payload, timeout=30)
+            
+            if r.status_code in (200, 201):
+                app.logger.info(f"✅ Message sent successfully to {phone}")
+            else:
+                app.logger.error(f"❌ WhatsApp API error: {r.status_code} - {r.text}")
+                
+        except Exception as e:
+            app.logger.error(f"Failed to send WhatsApp message: {e}")
+    
     except Exception as e:
-        app.logger.error(f"Failed to parse incoming webhook: {e}")
-        return "Bad Request", 400
+        app.logger.error(f"Error processing message: {e}")
 
     if not phone or not text:
         app.logger.warning(f"Missing phone or text; phone={phone}, text={text}")
