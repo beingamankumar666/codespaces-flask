@@ -1,19 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
 <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{{ title }}</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='main.css') }}">
-
+</head>
 <body>
     <div class="App">
         <header class="App-header">
             <img src="{{ url_for('static', filename='Octocat.png') }}" class="App-logo" alt="logo" />
+            <h1>🤖 WhatsApp AI Bot</h1>
             <p>
-                GitHub Codespaces <span class="heart">♥️</span> Flask
+                Powered by <strong>Google Gemini AI</strong>
             </p>
-            <p class="small">
-                Edit <code>templates/index.html</code> and refresh to see your changes!
+            <p class="identity">
+                👤 <strong>Aman Kumar</strong> - Tech-savvy, Cloud & AI Enthusiast
             </p>
+            <p class="description">
+                Hinglish (Hindi written in Roman script) Bot for WhatsApp Business
+            </p>
+            <div class="endpoints">
+                <h3>Webhook Endpoints:</h3>
+                <code>GET/POST /webhook</code>
+            </div>
         </header>
     </div>
 </body>
-
 </html>
