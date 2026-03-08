@@ -63,10 +63,11 @@ def get_verify_token():
 _gemini_client = None
 
 def get_gemini_client():
-    """Get or create Gemini client with lazy initialization."""
+    """Get or create Gemini model with lazy initialization."""
     global _gemini_client
     if _gemini_client is None:
-        _gemini_client = genai.Client(api_key=get_gemini_api_key())
+        genai.configure(api_key=get_gemini_api_key())
+        _gemini_client = genai.GenerativeModel(GEMINI_MODEL)
     return _gemini_client
 
 # ============================================================================
@@ -203,11 +204,9 @@ def whatsapp_webhook():
         # Build the prompt with system prompt and user message
         full_prompt = f"{AMAN_KUMAR_SYSTEM_PROMPT}\n\nUser ka message: {text}"
         
-        # Generate response using Gemini using new API
-        response = get_gemini_client().models.generate_content(
-            model=GEMINI_MODEL,
-            contents=full_prompt
-        )
+        # Generate response using Gemini
+        model = get_gemini_client()
+        response = model.generate_content(full_prompt)
         
         # Extract text from response
         if response and response.text:
